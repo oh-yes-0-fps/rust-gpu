@@ -156,12 +156,18 @@ pub enum SpirvMetadata {
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[non_exhaustive]
 pub enum ShaderPanicStrategy {
-    /// Return from shader entry-point with no side-effects **(default)**.
+    /// **(default)** [`SilentExit`](Self::SilentExit) in unoptimized builds (`opt-level = 0`),
+    /// where panics are how bugs surface, and no checks at all in optimized ones, which treat
+    /// panics as unreachable so bounds and overflow checks fold away. A failed check in an
+    /// optimized build is then undefined behavior, as with unchecked indexing.
+    #[default]
+    OptimizedUnreachable,
+
+    /// Return from shader entry-point with no side-effects, in every build.
     ///
     /// While similar to the standard SPIR-V `OpTerminateInvocation`, this is
     /// *not* limited to fragment shaders, and instead supports all shaders
     /// (as it's handled via control-flow rewriting, instead of SPIR-V features).
-    #[default]
     SilentExit,
 
     /// Like `SilentExit`, but also using `debugPrintf` to report the panic in
@@ -1004,7 +1010,8 @@ impl SpirvBuilder {
         }
         let mut target_features = vec![];
         let abort_strategy = match self.shader_panic_strategy {
-            ShaderPanicStrategy::SilentExit => None,
+            ShaderPanicStrategy::OptimizedUnreachable => None,
+            ShaderPanicStrategy::SilentExit => Some("silent-exit".into()),
             ShaderPanicStrategy::DebugPrintfThenExit {
                 print_inputs,
                 print_backtrace,

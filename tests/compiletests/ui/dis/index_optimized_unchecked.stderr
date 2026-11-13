@@ -1,0 +1,39 @@
+          %1 = OpFunction %2 None %3
+          %4 = OpLabel
+               OpLine %5 13 4
+          %6 = OpInBoundsAccessChain %7 %8 %9
+         %10 = OpArrayLength %11 %8 0
+               OpLine %5 14 4
+         %12 = OpInBoundsAccessChain %13 %14 %9
+               OpLine %5 16 21
+         %15 = OpLoad %11 %12
+               OpLine %5 16 15
+         %16 = OpULessThan %17 %15 %10
+               OpNoLine
+               OpSelectionMerge %18 None
+               OpBranchConditional %16 %19 %20
+         %19 = OpLabel
+               OpBranch %18
+         %20 = OpLabel
+               OpBranch %18
+         %18 = OpLabel
+               OpLine %5 16 15
+         %21 = OpIAdd %11 %9 %15
+         %22 = OpInBoundsAccessChain %23 %6 %21
+         %24 = OpLoad %25 %22
+               OpLine %5 16 4
+         %26 = OpULessThan %17 %9 %10
+               OpNoLine
+               OpSelectionMerge %27 None
+               OpBranchConditional %26 %28 %29
+         %28 = OpLabel
+               OpBranch %27
+         %29 = OpLabel
+               OpBranch %27
+         %27 = OpLabel
+               OpLine %5 16 4
+         %30 = OpInBoundsAccessChain %23 %6 %9
+               OpStore %30 %24
+               OpNoLine
+               OpReturn
+               OpFunctionEnd

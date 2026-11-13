@@ -458,7 +458,8 @@ impl CodegenArgs {
             opts.optopt(
                 "",
                 "abort-strategy",
-                "select a non-default abort (i.e. panic) strategy - see `spirv-builder` docs",
+                "select the abort (i.e. panic) strategy - see `spirv-builder` docs; without it, \
+                 optimized builds use `unreachable` and unoptimized ones `silent-exit`",
                 "STRATEGY",
             );
 
@@ -654,7 +655,15 @@ impl CodegenArgs {
                 .map(|s| s.to_string())
                 .collect(),
 
-            abort_strategy: matches.opt_str("abort-strategy"),
+            // Optimized builds treat panics as unreachable, so bounds and overflow checks
+            // fold away; unoptimized builds keep them, exiting the invocation on failure.
+            abort_strategy: matches
+                .opt_str("abort-strategy")
+                .or_else(|| {
+                    (sess.opts.optimize != rustc_session::config::OptLevel::No)
+                        .then(|| "unreachable".to_string())
+                })
+                .filter(|strategy| strategy != "silent-exit"),
             module_output_type: matches.opt_get_default("module-output", Default::default())?,
 
             // FIXME(eddyb) deduplicate between `CodegenArgs` and `linker::Options`.
