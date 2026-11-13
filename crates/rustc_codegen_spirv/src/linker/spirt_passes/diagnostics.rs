@@ -405,10 +405,11 @@ impl DiagnosticReporter<'_> {
             });
 
         let attrs_def = &self.cx[attrs];
-        if !self.linker_options.early_report_zombies
-            && let Some(zombie) = try_decode_custom_decoration::<ZombieDecoration<'_>>(attrs_def)
+        if let Some(zombie) = try_decode_custom_decoration::<ZombieDecoration<'_>>(attrs_def)
+            && let zombie = zombie.decode()
+            && (!self.linker_options.early_report_zombies || zombie.is_deferred())
         {
-            let ZombieDecoration { reason } = zombie.decode();
+            let ZombieDecoration { reason } = zombie;
             let def_span = current_def
                 .and_then(|def| def.to_rustc_span(self.cx, &mut self.span_regen))
                 .or_else(|| {

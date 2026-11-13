@@ -333,6 +333,7 @@ pub fn report_zombies(sess: &Session, module: &Module) -> super::Result<()> {
             .map(|inst| inst.result_id.unwrap()),
 
         id_to_zombie_kind: ZombieDecoration::decode_all(module)
+            .filter(|(_, zombie)| !zombie.decode().is_deferred())
             .map(|(id, _)| (id, ZombieKind::Leaf))
             .collect(),
     };

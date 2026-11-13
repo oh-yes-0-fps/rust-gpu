@@ -195,9 +195,10 @@ impl SpirvValue {
                     bitcast_result_id,
                     span,
                     &format!(
-                        "cannot cast between pointer types\
+                        "{}\
                          \nfrom `{}`\
                          \n  to `{}`",
+                        crate::custom_decorations::ZombieDecoration::DEFERRED_PTR_CAST,
                         cx.debug_type(original_ptr_ty),
                         cx.debug_type(self.ty)
                     ),

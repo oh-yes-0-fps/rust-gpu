@@ -109,6 +109,18 @@ pub struct ZombieDecoration<'a> {
     pub reason: Cow<'a, str>,
 }
 
+impl ZombieDecoration<'_> {
+    /// Reason given to pointer casts `pointercast` had to defer (`LogicalPtrCast`).
+    pub const DEFERRED_PTR_CAST: &'static str = "cannot cast between pointer types";
+
+    /// Whether the zombie may still be legalized after inlining (see
+    /// `linker::peephole_opts::legalize_ptr_bitcasts`), so it is only reported by the late
+    /// diagnostics, if it survives until then.
+    pub fn is_deferred(&self) -> bool {
+        self.reason.starts_with(Self::DEFERRED_PTR_CAST)
+    }
+}
+
 impl<'a> CustomDecoration<'a> for ZombieDecoration<'a> {
     const ENCODING_PREFIX: &'static str = "Z";
 

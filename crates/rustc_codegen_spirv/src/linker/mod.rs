@@ -481,6 +481,11 @@ pub fn link(
     }
 
     {
+        let _timer = sess.timer("link_legalize_ptr_bitcasts");
+        peephole_opts::legalize_ptr_bitcasts(&mut output);
+    }
+
+    {
         let _timer =
             sess.timer("link_dce-and-remove_duplicate_debuginfo-after-mem2reg-after-inlining");
         dce::dce(&mut output);

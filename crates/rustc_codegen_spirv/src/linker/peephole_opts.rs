@@ -680,3 +680,300 @@ pub fn fold_load_from_constant_variable(module: &mut Module) {
         }
     }
 }
+
+/// Replace each pointer-typed `OpPhi` whose incoming values are all one value (or the phi
+/// itself, around a loop) with that value. mem2reg leaves these when a pointer only passes
+/// through block parameters; logical addressing forbids pointer phis anyway.
+fn fold_trivial_pointer_phis(
+    func: &mut Function,
+    pointee: &FxHashMap<Word, (rspirv::spirv::StorageClass, Word)>,
+) {
+    loop {
+        let mut replace = FxHashMap::default();
+        for inst in func.all_inst_iter() {
+            if inst.class.opcode != Op::Phi
+                || !inst.result_type.is_some_and(|ty| pointee.contains_key(&ty))
+            {
+                continue;
+            }
+            let phi = inst.result_id.unwrap();
+            let mut incoming = inst
+                .operands
+                .chunks(2)
+                .map(|pair| pair[0].unwrap_id_ref())
+                .filter(|&v| v != phi);
+            let Some(first) = incoming.next() else {
+                continue;
+            };
+            if incoming.all(|v| v == first) {
+                replace.insert(phi, first);
+            }
+        }
+        if replace.is_empty() {
+            return;
+        }
+        let resolve = |mut id: Word| {
+            while let Some(&next) = replace.get(&id) {
+                id = next;
+            }
+            id
+        };
+        for block in &mut func.blocks {
+            block
+                .instructions
+                .retain(|inst| !inst.result_id.is_some_and(|id| replace.contains_key(&id)));
+            for inst in &mut block.instructions {
+                for op in &mut inst.operands {
+                    if let Operand::IdRef(id) = op {
+                        *id = resolve(*id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite access chains through pointer `OpBitcast`s left by `pointercast` when it could not
+/// express a cast as an access chain (`SpirvValueKind::LogicalPtrCast`), so that slices made
+/// from arrays and sub-slices of slices become legal once inlining has put the cast and its
+/// uses in one function:
+/// - `*[T; N] as *[T]` (array unsizing): `AccessChain(cast, i, ..)` indexes the array directly,
+///   `AccessChain(p, i, ..)`.
+/// - `*T as *[T]` where `*T` is itself `AccessChain(base, .., j)` into an array of `T`
+///   (`slice_from_raw_parts(&s[j], ..)`): `AccessChain(cast, i, ..)` becomes
+///   `AccessChain(base, .., j + i, ..)`.
+///
+/// Casts left unused are removed by the DCE that follows; any that survive keep their zombie
+/// and are reported by the late diagnostics.
+pub fn legalize_ptr_bitcasts(module: &mut Module) {
+    let Module {
+        header,
+        types_global_values,
+        functions,
+        ..
+    } = module;
+    let header = header.as_mut().unwrap();
+    let mut types = PtrTypes::new(types_global_values);
+    for func in functions.iter_mut() {
+        loop {
+            fold_trivial_pointer_phis(func, &types.pointee);
+            let mut defs = FxHashMap::default();
+            let mut func_result_type = types.result_type.clone();
+            for inst in func.parameters.iter().chain(func.all_inst_iter()) {
+                if let Some(id) = inst.result_id {
+                    defs.insert(id, inst.clone());
+                    if let Some(ty) = inst.result_type {
+                        func_result_type.insert(id, ty);
+                    }
+                }
+            }
+
+            let mut changed = false;
+            let mut retype = FxHashMap::default();
+            for block in &mut func.blocks {
+                let mut i = 0;
+                while i < block.instructions.len() {
+                    let inst = &block.instructions[i];
+                    i += 1;
+                    if !matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                        || inst.operands.len() < 2
+                    {
+                        continue;
+                    }
+                    let Some(cast) = defs
+                        .get(&inst.operands[0].unwrap_id_ref())
+                        .filter(|d| d.class.opcode == Op::Bitcast)
+                    else {
+                        continue;
+                    };
+                    let src = cast.operands[0].unwrap_id_ref();
+                    let (Some(&(src_class, src_pointee)), Some(&(_, dst_pointee))) = (
+                        func_result_type
+                            .get(&src)
+                            .and_then(|ty| types.pointee.get(ty)),
+                        cast.result_type.and_then(|ty| types.pointee.get(&ty)),
+                    ) else {
+                        continue;
+                    };
+                    let Some(&elem) = types.array_elem.get(&dst_pointee) else {
+                        continue;
+                    };
+                    let result = inst.result_id.unwrap();
+
+                    if types.array_elem.get(&src_pointee) == Some(&elem) {
+                        block.instructions[i - 1].operands[0] = Operand::IdRef(src);
+                        retype.insert(result, src_class);
+                        changed = true;
+                        continue;
+                    }
+
+                    let Some(outer) = defs.get(&src).filter(|d| {
+                        src_pointee == elem
+                            && matches!(d.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                            && d.operands.len() >= 2
+                    }) else {
+                        continue;
+                    };
+                    let outer_last = outer.operands.last().unwrap().unwrap_id_ref();
+                    let first = inst.operands[1].unwrap_id_ref();
+                    let int_ty = func_result_type.get(&outer_last).copied();
+                    if int_ty.is_none() || int_ty != func_result_type.get(&first).copied() {
+                        continue;
+                    }
+                    let sum = super::id(header);
+                    let add = Instruction::new(
+                        Op::IAdd,
+                        int_ty,
+                        Some(sum),
+                        vec![Operand::IdRef(outer_last), Operand::IdRef(first)],
+                    );
+                    let opcode = if outer.class.opcode == Op::InBoundsAccessChain
+                        && inst.class.opcode == Op::InBoundsAccessChain
+                    {
+                        Op::InBoundsAccessChain
+                    } else {
+                        Op::AccessChain
+                    };
+                    let mut operands = outer.operands[..outer.operands.len() - 1].to_vec();
+                    operands.push(Operand::IdRef(sum));
+                    operands.extend_from_slice(&inst.operands[2..]);
+                    block.instructions[i - 1] =
+                        Instruction::new(opcode, inst.result_type, Some(result), operands);
+                    block.instructions.insert(i - 1, add);
+                    retype.insert(result, src_class);
+                    changed = true;
+                    i += 1;
+                }
+            }
+            if !changed {
+                break;
+            }
+            retype_derived_pointers(func, retype, &mut types, header);
+        }
+    }
+    types_global_values.extend(types.created);
+}
+
+/// Pointer types by storage class and pointee, creating the ones a rewrite needs.
+struct PtrTypes {
+    pointee: FxHashMap<Word, (rspirv::spirv::StorageClass, Word)>,
+    by_class_and_pointee: FxHashMap<(rspirv::spirv::StorageClass, Word), Word>,
+    array_elem: FxHashMap<Word, Word>,
+    result_type: FxHashMap<Word, Word>,
+    created: Vec<Instruction>,
+}
+
+impl PtrTypes {
+    fn new(types_global_values: &[Instruction]) -> Self {
+        let mut types = Self {
+            pointee: FxHashMap::default(),
+            by_class_and_pointee: FxHashMap::default(),
+            array_elem: FxHashMap::default(),
+            result_type: FxHashMap::default(),
+            created: Vec::new(),
+        };
+        for inst in types_global_values {
+            let Some(id) = inst.result_id else { continue };
+            match inst.class.opcode {
+                Op::TypePointer => {
+                    let key = (
+                        inst.operands[0].unwrap_storage_class(),
+                        inst.operands[1].unwrap_id_ref(),
+                    );
+                    types.pointee.insert(id, key);
+                    types.by_class_and_pointee.entry(key).or_insert(id);
+                }
+                Op::TypeArray | Op::TypeRuntimeArray => {
+                    types
+                        .array_elem
+                        .insert(id, inst.operands[0].unwrap_id_ref());
+                }
+                _ => {}
+            }
+            if let Some(ty) = inst.result_type {
+                types.result_type.insert(id, ty);
+            }
+        }
+        types
+    }
+
+    fn pointer(
+        &mut self,
+        class: rspirv::spirv::StorageClass,
+        pointee: Word,
+        header: &mut ModuleHeader,
+    ) -> Word {
+        if let Some(&id) = self.by_class_and_pointee.get(&(class, pointee)) {
+            return id;
+        }
+        let id = super::id(header);
+        self.created.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(id),
+            vec![Operand::StorageClass(class), Operand::IdRef(pointee)],
+        ));
+        self.pointee.insert(id, (class, pointee));
+        self.by_class_and_pointee.insert((class, pointee), id);
+        id
+    }
+}
+
+/// Give each pointer in `retype`, and every pointer derived from one through access chains,
+/// copies or phis, a type in its storage class. A cast left these typed in the class
+/// inference guessed for the cast, which no longer matches the memory they point into.
+fn retype_derived_pointers(
+    func: &mut Function,
+    mut retype: FxHashMap<Word, rspirv::spirv::StorageClass>,
+    types: &mut PtrTypes,
+    header: &mut ModuleHeader,
+) {
+    loop {
+        let mut grew = false;
+        for inst in func.all_inst_iter() {
+            let Some(result) = inst.result_id else {
+                continue;
+            };
+            if retype.contains_key(&result)
+                || !inst
+                    .result_type
+                    .is_some_and(|ty| types.pointee.contains_key(&ty))
+            {
+                continue;
+            }
+            let from = match inst.class.opcode {
+                Op::AccessChain | Op::InBoundsAccessChain | Op::CopyObject => {
+                    retype.get(&inst.operands[0].unwrap_id_ref()).copied()
+                }
+                Op::Phi => inst
+                    .operands
+                    .chunks(2)
+                    .find_map(|pair| retype.get(&pair[0].unwrap_id_ref()).copied()),
+                _ => None,
+            };
+            if let Some(class) = from {
+                retype.insert(result, class);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            let (Some(result), Some(ty)) = (inst.result_id, inst.result_type) else {
+                continue;
+            };
+            let Some(&class) = retype.get(&result) else {
+                continue;
+            };
+            let Some(&(old_class, pointee)) = types.pointee.get(&ty) else {
+                continue;
+            };
+            if old_class != class {
+                inst.result_type = Some(types.pointer(class, pointee, header));
+            }
+        }
+    }
+}
