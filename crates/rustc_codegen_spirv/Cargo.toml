@@ -55,7 +55,7 @@ spirv-std-types = { workspace = true, features = ["std"] }
 rustc-demangle = "0.1.21"
 sanitize-filename = "0.6.0"
 smallvec = { version = "1.6.1", features = ["const_generics", "const_new", "union"] }
-spirt = "0.4.0"
+spirt = { git = "https://github.com/oh-yes-0-fps/spirt", rev = "a0b4a1e2502093a864269e85248d5464af0a4f74" }
 spirv-tools.workspace = true
 lazy_static = "1.4.0"
 itertools = "0.14.0"
