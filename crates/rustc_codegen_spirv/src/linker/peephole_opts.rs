@@ -977,3 +977,96 @@ fn retype_derived_pointers(
         }
     }
 }
+
+/// Turn each conditional branch with exactly one side that can only reach `OpUnreachable` into
+/// an unconditional branch to the other side. Reaching `OpUnreachable` is undefined behavior,
+/// so the condition may be assumed to hold; panics outside entry points lower to it (unless an
+/// abort strategy says otherwise), so this removes bounds and overflow checks from the code
+/// drivers schedule. A check left between memory operations keeps drivers from issuing them
+/// together (measured on NVIDIA: a register-blocked cooperative-matrix GEMM ran ~4.5× slower).
+///
+/// A block can only reach `OpUnreachable` when every instruction in it is free of side effects
+/// and every successor can only reach `OpUnreachable` too, as on the paths core's panic helpers
+/// take to the abort.
+pub fn fold_branches_to_unreachable(module: &mut Module) {
+    let pure_ext_sets: FxHashSet<Word> = module
+        .ext_inst_imports
+        .iter()
+        .filter(|inst| {
+            let name = inst.operands[0].unwrap_literal_string();
+            name == "GLSL.std.450" || name.starts_with("NonSemantic.Shader.DebugInfo")
+        })
+        .map(|inst| inst.result_id.unwrap())
+        .collect();
+    let is_pure = |inst: &Instruction| match inst.class.opcode {
+        Op::Line | Op::NoLine | Op::SelectionMerge | Op::Phi => true,
+        Op::ExtInst => pure_ext_sets.contains(&inst.operands[0].unwrap_id_ref()),
+        Op::FunctionCall | Op::LoopMerge => false,
+        op => inst.result_id.is_some() && !format!("{op:?}").starts_with("Atomic"),
+    };
+
+    for func in &mut module.functions {
+        let mut dead = FxHashSet::default();
+        loop {
+            let before = dead.len();
+            for block in &func.blocks {
+                let Some((terminator, body)) = block.instructions.split_last() else {
+                    continue;
+                };
+                let label = block.label_id().unwrap();
+                if dead.contains(&label) || !body.iter().all(is_pure) {
+                    continue;
+                }
+                let targets_dead = |ops: &[Operand]| {
+                    ops.iter().all(|op| match op {
+                        Operand::IdRef(id) => dead.contains(id),
+                        _ => true,
+                    })
+                };
+                let is_dead = match terminator.class.opcode {
+                    Op::Unreachable => true,
+                    Op::Branch => dead.contains(&terminator.operands[0].unwrap_id_ref()),
+                    Op::BranchConditional => targets_dead(&terminator.operands[1..3]),
+                    Op::Switch => targets_dead(&terminator.operands[1..]),
+                    _ => false,
+                };
+                if is_dead {
+                    dead.insert(label);
+                }
+            }
+            if dead.len() == before {
+                break;
+            }
+        }
+        if dead.is_empty() {
+            continue;
+        }
+
+        for block in &mut func.blocks {
+            if dead.contains(&block.label_id().unwrap()) {
+                continue;
+            }
+            let Some(terminator) = block.instructions.last() else {
+                continue;
+            };
+            if terminator.class.opcode != Op::BranchConditional {
+                continue;
+            }
+            let (if_true, if_false) = (
+                terminator.operands[1].unwrap_id_ref(),
+                terminator.operands[2].unwrap_id_ref(),
+            );
+            let live = match (dead.contains(&if_true), dead.contains(&if_false)) {
+                (false, true) => if_true,
+                (true, false) => if_false,
+                _ => continue,
+            };
+            let len = block.instructions.len();
+            block.instructions[len - 1] =
+                Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(live)]);
+            if len >= 2 && block.instructions[len - 2].class.opcode == Op::SelectionMerge {
+                block.instructions.remove(len - 2);
+            }
+        }
+    }
+}

@@ -669,6 +669,11 @@ pub fn link(
     }
 
     {
+        let _timer = sess.timer("link_fold_branches_to_unreachable");
+        peephole_opts::fold_branches_to_unreachable(&mut output);
+    }
+
+    {
         let _timer = sess.timer("link_remove_unused_type_capabilities");
         simple_passes::remove_unused_type_capabilities(&mut output);
     }
