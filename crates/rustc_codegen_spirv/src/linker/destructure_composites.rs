@@ -5,7 +5,7 @@
 //! will become valid targets for `OpLoad`/`OpStore`.
 use super::apply_rewrite_rules;
 use rspirv::dr::{Function, Instruction};
-use rspirv::spirv::Op;
+use rspirv::spirv::{Op, Word};
 use rustc_data_structures::fx::FxHashMap;
 
 pub fn destructure_composites(function: &mut Function) {
@@ -14,7 +14,7 @@ pub fn destructure_composites(function: &mut Function) {
         .all_inst_iter()
         .filter_map(|inst| match inst.class.opcode {
             Op::CompositeConstruct => Some((inst.result_id.unwrap(), inst.clone())),
-            Op::CompositeInsert if inst.operands.len() == 3 => {
+            Op::CompositeInsert if inst.operands.len() >= 3 => {
                 Some((inst.result_id.unwrap(), inst.clone()))
             }
             _ => None,
@@ -22,48 +22,14 @@ pub fn destructure_composites(function: &mut Function) {
         .collect();
 
     for inst in function.all_inst_iter_mut() {
-        // multi-index extraction for nested tuples/structs
         if inst.class.opcode == Op::CompositeExtract && inst.operands.len() >= 2 {
-            let mut current_id = inst.operands[0].unwrap_id_ref();
-            let mut final_origin = None;
-
-            // step through each index sequentially to resolve deeply nested extracts
-            for index_operand in &inst.operands[1..] {
-                let index = index_operand.unwrap_literal_bit32();
-
-                let mut search_id = current_id;
-                let mut resolved_id = None;
-
-                while let Some(inst) = reference.get(&search_id) {
-                    match inst.class.opcode {
-                        Op::CompositeInsert => {
-                            let insert_index = inst.operands[2].unwrap_literal_bit32();
-                            if insert_index == index {
-                                resolved_id = Some(inst.operands[0].unwrap_id_ref());
-                                break;
-                            }
-                            // If not our index, continue down the insert chain
-                            search_id = inst.operands[1].unwrap_id_ref();
-                        }
-                        Op::CompositeConstruct => {
-                            resolved_id =
-                                inst.operands.get(index as usize).map(|o| o.unwrap_id_ref());
-                            break;
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                if let Some(res) = resolved_id {
-                    current_id = res;
-                    final_origin = Some(res);
-                } else {
-                    final_origin = None;
-                    break;
-                }
-            }
-
-            if let Some(origin_id) = final_origin {
+            let path: Vec<u32> = inst.operands[1..]
+                .iter()
+                .map(|op| op.unwrap_literal_bit32())
+                .collect();
+            if let Some(origin_id) =
+                resolve_extract(&reference, inst.operands[0].unwrap_id_ref(), &path)
+            {
                 rewrite_rules.insert(
                     inst.result_id.unwrap(),
                     rewrite_rules.get(&origin_id).map_or(origin_id, |id| *id),
@@ -88,4 +54,43 @@ pub fn destructure_composites(function: &mut Function) {
             .retain(|inst| inst.class.opcode != Op::Nop);
     }
     apply_rewrite_rules(&closed_rewrite_rules, &mut function.blocks);
+}
+
+/// The value at `path` inside `composite`, if the `OpCompositeConstruct`s and
+/// `OpCompositeInsert`s (at any depth) that built it name it directly. An insert at
+/// exactly `path` gives its object; one at a prefix of `path` continues inside its
+/// object; one off `path` continues into the composite it was inserted into. An
+/// insert below `path` leaves no existing value equal to the extraction.
+fn resolve_extract(
+    reference: &FxHashMap<Word, Instruction>,
+    mut composite: Word,
+    mut path: &[u32],
+) -> Option<Word> {
+    loop {
+        if path.is_empty() {
+            return Some(composite);
+        }
+        let inst = reference.get(&composite)?;
+        match inst.class.opcode {
+            Op::CompositeConstruct => {
+                composite = inst.operands.get(path[0] as usize)?.unwrap_id_ref();
+                path = &path[1..];
+            }
+            Op::CompositeInsert => {
+                let insert_path: Vec<u32> = inst.operands[2..]
+                    .iter()
+                    .map(|op| op.unwrap_literal_bit32())
+                    .collect();
+                if path.starts_with(&insert_path) {
+                    composite = inst.operands[0].unwrap_id_ref();
+                    path = &path[insert_path.len()..];
+                } else if insert_path.starts_with(path) {
+                    return None;
+                } else {
+                    composite = inst.operands[1].unwrap_id_ref();
+                }
+            }
+            _ => return None,
+        }
+    }
 }
