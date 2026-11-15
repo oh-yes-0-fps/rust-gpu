@@ -757,6 +757,12 @@ pub fn legalize_ptr_bitcasts(module: &mut Module) {
     for func in functions.iter_mut() {
         loop {
             fold_trivial_pointer_phis(func, &types.pointee);
+            let split = split_pointer_aggregate_phis(func, &types, header);
+            if split {
+                super::destructure_composites::destructure_composites(func);
+                fold_trivial_pointer_phis(func, &types.pointee);
+            }
+            let indexed = index_pointer_phis(func, &types, header);
             let mut defs = FxHashMap::default();
             let mut func_result_type = types.result_type.clone();
             for inst in func.parameters.iter().chain(func.all_inst_iter()) {
@@ -845,10 +851,11 @@ pub fn legalize_ptr_bitcasts(module: &mut Module) {
                     i += 1;
                 }
             }
-            if !changed {
+            if !changed && !split && !indexed {
                 break;
             }
             retype_derived_pointers(func, retype, &mut types, header);
+            super::destructure_composites::destructure_composites(func);
         }
     }
     types_global_values.extend(types.created);
@@ -857,6 +864,9 @@ pub fn legalize_ptr_bitcasts(module: &mut Module) {
 /// Pointer types by storage class and pointee, creating the ones a rewrite needs.
 struct PtrTypes {
     pointee: FxHashMap<Word, (rspirv::spirv::StorageClass, Word)>,
+    members: FxHashMap<Word, Vec<Word>>,
+    arrays: FxHashMap<Word, (Word, u32)>,
+    zero_u32: Option<Word>,
     by_class_and_pointee: FxHashMap<(rspirv::spirv::StorageClass, Word), Word>,
     array_elem: FxHashMap<Word, Word>,
     result_type: FxHashMap<Word, Word>,
@@ -867,6 +877,9 @@ impl PtrTypes {
     fn new(types_global_values: &[Instruction]) -> Self {
         let mut types = Self {
             pointee: FxHashMap::default(),
+            members: FxHashMap::default(),
+            arrays: FxHashMap::default(),
+            zero_u32: None,
             by_class_and_pointee: FxHashMap::default(),
             array_elem: FxHashMap::default(),
             result_type: FxHashMap::default(),
@@ -888,13 +901,98 @@ impl PtrTypes {
                         .array_elem
                         .insert(id, inst.operands[0].unwrap_id_ref());
                 }
+                Op::TypeStruct => {
+                    types.members.insert(
+                        id,
+                        inst.operands.iter().map(|op| op.unwrap_id_ref()).collect(),
+                    );
+                }
                 _ => {}
             }
             if let Some(ty) = inst.result_type {
                 types.result_type.insert(id, ty);
             }
         }
+        let constants: FxHashMap<Word, u32> = types_global_values
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Constant)
+            .filter_map(|inst| match inst.operands[0] {
+                Operand::LiteralBit32(v) => Some((inst.result_id?, v)),
+                _ => None,
+            })
+            .collect();
+        let u32_ty = types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == Op::TypeInt
+                    && inst.operands == [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]
+            })
+            .and_then(|inst| inst.result_id);
+        types.zero_u32 = types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == Op::Constant
+                    && inst.result_type == u32_ty
+                    && u32_ty.is_some()
+                    && inst.operands == [Operand::LiteralBit32(0)]
+            })
+            .and_then(|inst| inst.result_id);
+        for inst in types_global_values {
+            if inst.class.opcode == Op::TypeArray
+                && let Some(&len) = constants.get(&inst.operands[1].unwrap_id_ref())
+            {
+                types.arrays.insert(
+                    inst.result_id.unwrap(),
+                    (inst.operands[0].unwrap_id_ref(), len),
+                );
+            }
+        }
         types
+    }
+
+    /// Whether `ty` holds no data (structs of nothing but such structs, or empty arrays).
+    fn is_empty(&self, ty: Word) -> bool {
+        self.members
+            .get(&ty)
+            .is_some_and(|m| m.iter().all(|&t| self.is_empty(t)))
+            || self
+                .arrays
+                .get(&ty)
+                .is_some_and(|&(e, len)| len == 0 || self.is_empty(e))
+    }
+
+    fn contains_pointer(&self, ty: Word) -> bool {
+        self.pointee.contains_key(&ty)
+            || self
+                .members
+                .get(&ty)
+                .is_some_and(|m| m.iter().any(|&t| self.contains_pointer(t)))
+            || self
+                .arrays
+                .get(&ty)
+                .is_some_and(|&(e, _)| self.contains_pointer(e))
+    }
+
+    /// The parts of `ty` a pointer-free value is made of: pointers, and the largest pointer-free
+    /// aggregates, with their access paths. Aggregates holding a pointer are split.
+    fn pointer_leaves(&self, ty: Word, path: &mut Vec<u32>, out: &mut Vec<(Vec<u32>, Word)>) {
+        if self.pointee.contains_key(&ty) || !self.contains_pointer(ty) {
+            out.push((path.clone(), ty));
+        } else if let Some(members) = self.members.get(&ty) {
+            for (i, &member) in members.iter().enumerate() {
+                path.push(i as u32);
+                self.pointer_leaves(member, path, out);
+                path.pop();
+            }
+        } else if let Some(&(elem, len)) = self.arrays.get(&ty) {
+            for i in 0..len {
+                path.push(i);
+                self.pointer_leaves(elem, path, out);
+                path.pop();
+            }
+        } else {
+            out.push((path.clone(), ty));
+        }
     }
 
     fn pointer(
@@ -1069,4 +1167,432 @@ pub fn fold_branches_to_unreachable(module: &mut Module) {
             }
         }
     }
+}
+
+/// Insert `insts` at the end of `block`, before its terminator and any merge instruction.
+fn insert_before_terminator(block: &mut rspirv::dr::Block, insts: Vec<Instruction>) {
+    let mut at = block.instructions.len() - 1;
+    if at > 0
+        && matches!(
+            block.instructions[at - 1].class.opcode,
+            Op::SelectionMerge | Op::LoopMerge
+        )
+    {
+        at -= 1;
+    }
+    block.instructions.splice(at..at, insts);
+}
+
+fn replace_uses(func: &mut Function, from: Word, to: Word) {
+    for inst in func.all_inst_iter_mut() {
+        for op in &mut inst.operands {
+            if *op == Operand::IdRef(from) {
+                *op = Operand::IdRef(to);
+            }
+        }
+    }
+}
+
+/// Split each `OpPhi` of an aggregate type holding a pointer into one phi per part (see
+/// [`PtrTypes::pointer_leaves`]), extracting the parts at the end of each predecessor and
+/// rebuilding the aggregate after the block's phis. Logical addressing forbids pointers inside
+/// aggregates; once split, the pointer phis can be legalized on their own.
+fn split_pointer_aggregate_phis(
+    func: &mut Function,
+    types: &PtrTypes,
+    header: &mut ModuleHeader,
+) -> bool {
+    let mut changed = false;
+    loop {
+        let found = func.blocks.iter().enumerate().find_map(|(b, block)| {
+            block
+                .instructions
+                .iter()
+                .take_while(|inst| inst.class.opcode == Op::Phi)
+                .position(|inst| {
+                    let ty = inst.result_type.unwrap();
+                    !types.pointee.contains_key(&ty) && types.contains_pointer(ty)
+                })
+                .map(|i| (b, i))
+        });
+        let Some((b, i)) = found else { return changed };
+        changed = true;
+        let phi = func.blocks[b].instructions.remove(i);
+        let phi_id = phi.result_id.unwrap();
+        let ty = phi.result_type.unwrap();
+        let mut leaves = Vec::new();
+        types.pointer_leaves(ty, &mut Vec::new(), &mut leaves);
+
+        let label_to_block: FxHashMap<Word, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| (block.label_id().unwrap(), i))
+            .collect();
+        let incoming: Vec<(Word, Word)> = phi
+            .operands
+            .chunks(2)
+            .map(|pair| (pair[0].unwrap_id_ref(), pair[1].unwrap_id_ref()))
+            .collect();
+        let leaf_ids: Vec<Word> = leaves.iter().map(|_| super::id(header)).collect();
+        // Parts that hold no data need no phi; nothing ever writes them, so tracing them back
+        // through the incoming values would only end at an `OpUndef` and keep the rest alive.
+        let empty: Vec<bool> = leaves
+            .iter()
+            .map(|&(_, leaf_ty)| types.is_empty(leaf_ty))
+            .collect();
+        let mut leaf_operands: Vec<Vec<Operand>> = vec![Vec::new(); leaves.len()];
+        for &(value, pred) in &incoming {
+            let mut extracts = Vec::new();
+            for (l, (path, leaf_ty)) in leaves.iter().enumerate() {
+                if empty[l] {
+                    continue;
+                }
+                let part = if value == phi_id {
+                    leaf_ids[l]
+                } else {
+                    let id = super::id(header);
+                    let mut operands = vec![Operand::IdRef(value)];
+                    operands.extend(path.iter().map(|&i| Operand::LiteralBit32(i)));
+                    extracts.push(Instruction::new(
+                        Op::CompositeExtract,
+                        Some(*leaf_ty),
+                        Some(id),
+                        operands,
+                    ));
+                    id
+                };
+                leaf_operands[l].extend([Operand::IdRef(part), Operand::IdRef(pred)]);
+            }
+            if let Some(&pb) = label_to_block.get(&pred) {
+                insert_before_terminator(&mut func.blocks[pb], extracts);
+            }
+        }
+
+        let mut rebuild: Vec<Instruction> = leaves
+            .iter()
+            .zip(&leaf_ids)
+            .zip(&empty)
+            .filter(|(_, is_empty)| **is_empty)
+            .map(|(((_, leaf_ty), &id), _)| {
+                Instruction::new(Op::Undef, Some(*leaf_ty), Some(id), vec![])
+            })
+            .collect();
+        let root = build_from_leaves(
+            types,
+            ty,
+            &mut Vec::new(),
+            &leaves,
+            &leaf_ids,
+            &mut rebuild,
+            header,
+        );
+        let block = &mut func.blocks[b];
+        let new_phis = leaves
+            .iter()
+            .zip(&leaf_ids)
+            .zip(leaf_operands)
+            .zip(&empty)
+            .filter(|(_, is_empty)| !**is_empty)
+            .map(|((((_, leaf_ty), &id), operands), _)| {
+                Instruction::new(Op::Phi, Some(*leaf_ty), Some(id), operands)
+            });
+        block.instructions.splice(i..i, new_phis);
+        let after_phis = block
+            .instructions
+            .iter()
+            .take_while(|inst| inst.class.opcode == Op::Phi)
+            .count();
+        block.instructions.splice(after_phis..after_phis, rebuild);
+        replace_uses(func, phi_id, root);
+    }
+}
+
+/// The value of type `ty` at `path` rebuilt from `leaves`, pushing the constructs onto `out`.
+fn build_from_leaves(
+    types: &PtrTypes,
+    ty: Word,
+    path: &mut Vec<u32>,
+    leaves: &[(Vec<u32>, Word)],
+    leaf_ids: &[Word],
+    out: &mut Vec<Instruction>,
+    header: &mut ModuleHeader,
+) -> Word {
+    if let Some(l) = leaves.iter().position(|(p, _)| p == path) {
+        return leaf_ids[l];
+    }
+    let parts: Vec<Word> = if let Some(members) = types.members.get(&ty) {
+        members.clone()
+    } else {
+        let (elem, len) = types.arrays[&ty];
+        vec![elem; len as usize]
+    };
+    let mut constituents = Vec::new();
+    for (i, part_ty) in parts.into_iter().enumerate() {
+        path.push(i as u32);
+        constituents.push(Operand::IdRef(build_from_leaves(
+            types, part_ty, path, leaves, leaf_ids, out, header,
+        )));
+        path.pop();
+    }
+    let id = super::id(header);
+    out.push(Instruction::new(
+        Op::CompositeConstruct,
+        Some(ty),
+        Some(id),
+        constituents,
+    ));
+    id
+}
+
+/// One incoming pointer of a phi `index_pointer_phis` rewrites, as an element pointer
+/// `AccessChain(prefix.., index)`. `index` is `Offset(off)` for a re-slice of the phi itself
+/// (`&prev[off..]`): the phi's own index plus `off`.
+struct Incoming {
+    chain_ty: Word,
+    prefix: Vec<Operand>,
+    inbounds: bool,
+    index: IncomingIndex,
+}
+
+#[derive(Clone, Copy)]
+enum IncomingIndex {
+    At(Word),
+    Offset(Word),
+    Same,
+}
+
+/// Rewrite each pointer `OpPhi` whose incoming pointers all address one array, differing only in
+/// the element they start at, into one `AccessChain` over a phi of that index. Logical addressing
+/// forbids choosing between pointers at run time; a loop that carries a slice (or a struct or
+/// array holding one, once split) from step to step needs exactly this.
+///
+/// For a slice phi (a pointer to an array), each incoming slice may be a whole array or slice
+/// (index 0), a sub-slice `Bitcast(AccessChain(.., i))` (index `i`), or a sub-slice of the phi
+/// itself (its index plus the offset); the result is the bitcast of the new access chain. For an
+/// element pointer phi, each incoming value is an `AccessChain(.., i)`.
+fn index_pointer_phis(func: &mut Function, types: &PtrTypes, header: &mut ModuleHeader) -> bool {
+    let mut changed = false;
+    loop {
+        let defs: FxHashMap<Word, Instruction> = func
+            .all_inst_iter()
+            .filter_map(|inst| Some((inst.result_id?, inst.clone())))
+            .collect();
+        let type_of = |id: Word| {
+            defs.get(&id)
+                .and_then(|d| d.result_type)
+                .or_else(|| types.result_type.get(&id).copied())
+        };
+
+        let mut plan = None;
+        'search: for (b, block) in func.blocks.iter().enumerate() {
+            for (i, phi) in block
+                .instructions
+                .iter()
+                .enumerate()
+                .take_while(|(_, inst)| inst.class.opcode == Op::Phi)
+            {
+                let Some(&(_, phi_pointee)) = phi.result_type.and_then(|ty| types.pointee.get(&ty))
+                else {
+                    continue;
+                };
+                let phi_id = phi.result_id.unwrap();
+                let slice_elem = types.array_elem.get(&phi_pointee).copied();
+                let incoming: Option<Vec<(Option<Incoming>, Word)>> = phi
+                    .operands
+                    .chunks(2)
+                    .map(|pair| {
+                        let (value, pred) = (pair[0].unwrap_id_ref(), pair[1].unwrap_id_ref());
+                        if value == phi_id {
+                            return Some((None, pred));
+                        }
+                        let desc = describe_incoming(
+                            value,
+                            phi_id,
+                            slice_elem,
+                            phi.result_type.unwrap(),
+                            &defs,
+                            types,
+                            &type_of,
+                        )?;
+                        Some((Some(desc), pred))
+                    })
+                    .collect();
+                let Some(incoming) = incoming else { continue };
+                let described: Vec<&Incoming> =
+                    incoming.iter().filter_map(|(d, _)| d.as_ref()).collect();
+                let Some(anchor) = described
+                    .iter()
+                    .find(|d| matches!(d.index, IncomingIndex::At(_)))
+                else {
+                    continue;
+                };
+                let IncomingIndex::At(anchor_index) = anchor.index else {
+                    unreachable!()
+                };
+                let idx_ty = type_of(anchor_index);
+                let index_ty_matches = |d: &Incoming| match d.index {
+                    IncomingIndex::At(x) | IncomingIndex::Offset(x) => type_of(x) == idx_ty,
+                    IncomingIndex::Same => true,
+                };
+                let consistent = described.iter().all(|d| {
+                    d.chain_ty == anchor.chain_ty
+                        && (matches!(d.index, IncomingIndex::Offset(_))
+                            || d.prefix == anchor.prefix)
+                        && index_ty_matches(d)
+                });
+                if !consistent || idx_ty.is_none() {
+                    continue;
+                }
+                let inbounds = described.iter().all(|d| d.inbounds);
+                let indices: Vec<(IncomingIndex, Word)> = incoming
+                    .iter()
+                    .map(|(d, pred)| (d.as_ref().map_or(IncomingIndex::Same, |d| d.index), *pred))
+                    .collect();
+                let cast = slice_elem.map(|_| phi.result_type.unwrap());
+                plan = Some((
+                    b,
+                    i,
+                    phi_id,
+                    cast,
+                    anchor.chain_ty,
+                    anchor.prefix.clone(),
+                    inbounds,
+                    idx_ty.unwrap(),
+                    indices,
+                ));
+                break 'search;
+            }
+        }
+        let Some((b, i, phi_id, cast, chain_ty, mut prefix, inbounds, idx_ty, indices)) = plan
+        else {
+            return changed;
+        };
+        changed = true;
+        let idx_phi = super::id(header);
+        let label_to_block: FxHashMap<Word, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| (block.label_id().unwrap(), i))
+            .collect();
+        let mut operands = Vec::new();
+        for (index, pred) in indices {
+            let index = match index {
+                IncomingIndex::At(x) => x,
+                IncomingIndex::Same => idx_phi,
+                IncomingIndex::Offset(offset) => {
+                    let sum = super::id(header);
+                    let add = Instruction::new(
+                        Op::IAdd,
+                        Some(idx_ty),
+                        Some(sum),
+                        vec![Operand::IdRef(idx_phi), Operand::IdRef(offset)],
+                    );
+                    insert_before_terminator(&mut func.blocks[label_to_block[&pred]], vec![add]);
+                    sum
+                }
+            };
+            operands.extend([Operand::IdRef(index), Operand::IdRef(pred)]);
+        }
+        let ac = super::id(header);
+        prefix.push(Operand::IdRef(idx_phi));
+        let opcode = if inbounds {
+            Op::InBoundsAccessChain
+        } else {
+            Op::AccessChain
+        };
+        let mut after = vec![Instruction::new(opcode, Some(chain_ty), Some(ac), prefix)];
+        let result = if let Some(cast_ty) = cast {
+            let id = super::id(header);
+            after.push(Instruction::new(
+                Op::Bitcast,
+                Some(cast_ty),
+                Some(id),
+                vec![Operand::IdRef(ac)],
+            ));
+            id
+        } else {
+            ac
+        };
+        let block = &mut func.blocks[b];
+        block.instructions[i] = Instruction::new(Op::Phi, Some(idx_ty), Some(idx_phi), operands);
+        let after_phis = block
+            .instructions
+            .iter()
+            .take_while(|inst| inst.class.opcode == Op::Phi)
+            .count();
+        block.instructions.splice(after_phis..after_phis, after);
+        replace_uses(func, phi_id, result);
+    }
+}
+
+/// `value` as an [`Incoming`] of a phi of type `phi_ty` (a slice of `slice_elem`, or an element
+/// pointer when `slice_elem` is `None`), if it is one of the forms `index_pointer_phis` handles.
+fn describe_incoming(
+    value: Word,
+    phi_id: Word,
+    slice_elem: Option<Word>,
+    phi_ty: Word,
+    defs: &FxHashMap<Word, Instruction>,
+    types: &PtrTypes,
+    type_of: &impl Fn(Word) -> Option<Word>,
+) -> Option<Incoming> {
+    let is_chain = |d: &&Instruction| {
+        matches!(d.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) && d.operands.len() >= 2
+    };
+    let element_chain = |id: Word| -> Option<Incoming> {
+        let ac = defs.get(&id).filter(is_chain)?;
+        let base = ac.operands[0].unwrap_id_ref();
+        let last = ac.operands.last().unwrap().unwrap_id_ref();
+        let (index, prefix) = if base == phi_id && ac.operands.len() == 2 {
+            (IncomingIndex::Offset(last), Vec::new())
+        } else {
+            (
+                IncomingIndex::At(last),
+                ac.operands[..ac.operands.len() - 1].to_vec(),
+            )
+        };
+        Some(Incoming {
+            chain_ty: ac.result_type?,
+            prefix,
+            inbounds: ac.class.opcode == Op::InBoundsAccessChain,
+            index,
+        })
+    };
+    let Some(elem) = slice_elem else {
+        return element_chain(value).filter(|d| d.chain_ty == phi_ty);
+    };
+    let elem_ptr = |id: Word| {
+        type_of(id)
+            .and_then(|ty| types.pointee.get(&ty))
+            .is_some_and(|&(_, p)| p == elem)
+    };
+    if let Some(d) = defs.get(&value).filter(|d| d.class.opcode == Op::Bitcast) {
+        let inner = d.operands[0].unwrap_id_ref();
+        if elem_ptr(inner) {
+            return element_chain(inner);
+        }
+        return whole(inner, elem, types, type_of);
+    }
+    whole(value, elem, types, type_of)
+}
+
+/// A pointer to a whole array or slice of `elem` as the access chain to its first element.
+fn whole(
+    array: Word,
+    elem: Word,
+    types: &PtrTypes,
+    type_of: &impl Fn(Word) -> Option<Word>,
+) -> Option<Incoming> {
+    let &(class, pointee) = types.pointee.get(&type_of(array)?)?;
+    if types.array_elem.get(&pointee) != Some(&elem) {
+        return None;
+    }
+    Some(Incoming {
+        chain_ty: *types.by_class_and_pointee.get(&(class, elem))?,
+        prefix: vec![Operand::IdRef(array)],
+        inbounds: true,
+        index: IncomingIndex::At(types.zero_u32?),
+    })
 }
